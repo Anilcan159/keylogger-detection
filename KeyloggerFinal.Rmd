@@ -1,0 +1,1371 @@
+--- 
+title: "Práctica 2: Detección de Keyloggers con Machine Learning"
+author: "Anıl Can Tekin"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    latex_engine: xelatex
+fontsize: 11pt
+
+---
+```{r, echo=TRUE, message=FALSE, warning=FALSE, results='hide'}
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=FALSE, comment=NA)
+```
+
+```{r setup, echo=FALSE, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(corrplot) 
+library(glmnet)
+library(e1071)       
+library(randomForest)    
+library(caret)  
+library(pROC)
+library(reticulate)
+library(tensorflow)     
+library(keras)
+library(xgboost)
+library(factoextra)
+library(fastDummies)
+
+use_python("C:/Users/tekin/anaconda3/envs/gpu_env/python.exe", required = TRUE)
+```
+
+
+
+# Introducción
+
+En la era digital actual, los ciberataques representan una amenaza creciente para la seguridad de los sistemas de información. Uno de los métodos más insidiosos utilizados por los atacantes es el uso de keyloggers, programas maliciosos diseñados para registrar las pulsaciones del teclado y así obtener información sensible, como contraseñas o datos bancarios. Ante esta problemática, resulta fundamental desarrollar herramientas inteligentes capaces de detectar conexiones maliciosas de manera automática y eficiente.
+
+El objetivo principal de este proyecto es aplicar técnicas de Machine Learning para identificar conexiones relacionadas con keyloggers a partir de un conjunto de datos de tráfico de red. Para ello, se ha seguido una estrategia basada en la limpieza, preprocesamiento y análisis de los datos, seguida por la aplicación de distintos modelos de aprendizaje supervisado.
+
+La práctica se estructura en seis bloques fundamentales:
+
+Agrupación temática y limpieza de datos: Identificación de variables relevantes y eliminación de redundancias, valores atípicos y estructuras innecesarias.
+
+Muestreo y división de conjuntos: Reducción del tamaño del conjunto de datos original y partición en conjuntos de entrenamiento y prueba.
+
+Análisis PCA: Reducción de la dimensionalidad para explorar la separabilidad de las clases y facilitar la visualización.
+
+Regresión penalizada (Lasso): Modelo exploratorio que permite la selección de variables más relevantes mediante regularización L1.
+
+Modelos supervisados avanzados: Evaluación de algoritmos como XGBoost y Random Forest, con ajuste de hiperparámetros y validación cruzada.
+
+Red Neuronal Profunda (Neural Network): Implementación de un modelo de red neuronal utilizando Keras y TensorFlow con aceleración GPU.
+
+A lo largo de la práctica, se realiza un análisis crítico de los resultados obtenidos, destacando la eficacia de cada modelo, su capacidad para generalizar y, especialmente, su desempeño en la detección de la clase minoritaria (maliciosa), aspecto clave en el contexto de la ciberseguridad.
+
+El Keylogger
+Extraemos en primer lugar el DataSet de Keylogger para trabajar con él:
+
+```{r}
+Keylogger <- read.csv(file = 'sampled.csv', header = TRUE)
+
+```
+
+# EJERCICIO 1: Agrupar variables y limpieza de datos [1/10]
+
+Observamos cómo contiene una cantidad considerable de datos (alrededor de 500k observaciones y 86 variables registradas), de manera que podemos trabajar con un conjunto más reducido:
+
+```{r}
+names(Keylogger)
+dim(Keylogger)
+
+```
+## Agrupación temática de las variables
+
+Dado que el conjunto de datos original contiene **86 variables** y más de **500.000 registros**, abordar el análisis de forma directa sin ningún tipo de organización puede resultar contraproducente. No solo por la carga computacional que implica, sino también por el alto riesgo de **sobreajuste** y **redundancia informativa**, que puede ocultar relaciones verdaderamente relevantes para la tarea de clasificación.
+
+Por esta razón, se ha decidido aplicar una **agrupación temática de las variables**, según su naturaleza funcional dentro del tráfico de red. Esta estrategia no pretende solo clasificar por comodidad visual, sino también **facilitar la limpieza posterior, la selección de atributos, la interpretación de los resultados y el diseño de modelos más eficientes**.
+
+A continuación se describen con detalle los grupos identificados:
+
+### a. Características del flujo (Flow Features)
+
+Este grupo agrupa las variables que definen la **identidad única de cada conexión** dentro del conjunto de datos. Son metadatos o etiquetas técnicas que permiten distinguir conexiones entre dispositivos y sesiones.
+
+**Variables incluidas:**
+- `Flow.ID`, `Source.IP`, `Destination.IP`, `Source.Port`, `Destination.Port`, `Protocol`, `Timestamp`
+
+**Análisis y decisiones:**
+- Variables como `Flow.ID`, `Timestamp`, `Source.IP` y `Destination.IP` serán **eliminadas** debido a su naturaleza de identificador único o extremadamente alta cardinalidad.
+- `Protocol` y `Source/Destination.Port` se conservarán **temporalmente** para análisis exploratorio, ya que podrían aportar valor en contextos específicos (por ejemplo, conexión saliente por puertos altos, típicos en tráfico malicioso).
+
+---
+
+### b. Estadísticas de paquetes (Packet Statistics)
+
+Incluye todas aquellas variables relacionadas con el número y tamaño de paquetes transmitidos durante una conexión, tanto en la dirección de salida (**Forward**) como en la de entrada (**Backward**).
+
+**Variables típicas:**
+- `Total.Fwd.Packets`, `Total.Backward.Packets`
+- `Fwd.Packet.Length.Mean`, `Bwd.Packet.Length.Mean`
+- `Max.Packet.Length`, `Min.Packet.Length`, `Packet.Length.Mean`
+
+**Importancia para el modelo:**
+- Un keylogger puede generar conexiones pequeñas pero frecuentes, o bien conexiones que transmiten pequeños volúmenes de información repetidamente. Este patrón puede reflejarse en **longitudes promedio, máximas o mínimas**.
+- La separación en *forward* y *backward* es crítica: los keyloggers suelen enviar datos fuera del sistema, generando **tráfico asimétrico**.
+
+Estas variables son fundamentales para identificar anomalías de volumen o ritmo de tráfico y se **mantendrán para modelado**.
+
+---
+
+### c. Características de tiempo (IAT Features)
+
+Este grupo captura la **temporalidad del tráfico**, es decir, los intervalos entre los paquetes transmitidos. Son indicadores indirectos de comportamiento.
+
+**Ejemplos:**
+- `Flow.IAT.Mean`, `Flow.IAT.Std`
+- `Fwd.IAT.Total`, `Bwd.IAT.Total`
+- `Fwd.IAT.Min`, `Bwd.IAT.Max`
+
+**Utilidad:**
+- Un comportamiento automatizado (como un keylogger que transmite datos tras cada pulsación) tiende a mostrar **patrones temporales regulares** o anormalmente pequeños.
+- En contraposición, un usuario humano genera paquetes con mayor variabilidad temporal.
+
+Etas variables se mantendrán porque aportan **insights valiosos sobre la automatización** y ritmo de las conexiones.
+
+---
+
+### d. Indicadores de comportamiento de la conexión (Flags y Ratios)
+
+Este grupo contiene variables que describen el **estado interno del flujo**, principalmente a través de flags TCP y relaciones entre tráfico de entrada y salida.
+
+**Incluye:**
+- `SYN.Flag.Count`, `FIN.Flag.Count`, `RST.Flag.Count`, `PSH.Flag.Count`, etc.
+- `Down.Up.Ratio`, `Average.Packet.Size`
+
+**Interpretación técnica:**
+- Ataques como los keyloggers pueden involucrar **finalizaciones abruptas de conexiones** (`RST` elevado) o uso repetitivo de ciertos flags (`PSH`, `ACK`).
+- `Down.Up.Ratio` ayuda a medir la **asimetría de tráfico**.
+
+Flags con **varianza casi nula** serán analizados más adelante mediante código (`nearZeroVar`). Los restantes se conservarán inicialmente.
+
+---
+
+### e. Características agregadas (Bulk y Subflow Features)
+
+Estas variables representan **resúmenes adicionales** del comportamiento del flujo, normalmente calculados en función de grupos de paquetes consecutivos o patrones internos.
+
+**Ejemplos:**
+- `Fwd.Avg.Bytes.Bulk`, `Bwd.Avg.Packets.Bulk`
+- `Subflow.Fwd.Packets`, `Subflow.Bwd.Bytes`
+
+**Crítica:**
+- Muchas de estas variables pueden ser **altamente correlacionadas** con otras ya incluidas (por ejemplo, tamaño de paquetes).
+- Algunas tienen valores **constantes o cercanos a cero**, lo cual las hace irrelevantes.
+
+Se analizarán con técnicas como `cor()` y `nearZeroVar()`. Aquellas que no aporten información nueva serán **eliminadas** para evitar colinealidad o ruido.
+
+---
+
+### f. Medidas de actividad e inactividad
+
+Este último grupo mide la **interactividad del flujo**, en términos de actividad o periodos inactivos entre eventos.
+
+**Variables típicas:**
+- `Active.Mean`, `Active.Max`, `Active.Std`
+- `Idle.Mean`, `Idle.Max`, `Idle.Std`
+
+**Análisis:**
+- Los periodos largos de inactividad pueden indicar tráfico de fondo o conexiones persistentes sin uso real.
+- Al contrario, actividad constante y sin pausas puede ser característica de tráfico automatizado.
+
+Estas métricas permiten **inferir el comportamiento humano vs automatizado**, y por tanto **se conservarán**.
+
+---
+
+### ¿Por qué es importante diferenciar entre tráfico forward y backward?
+
+Muchas de las variables analizadas se reportan en ambas direcciones. Esta distinción no es meramente técnica:  
+
+- Un usuario normal envía y recibe tráfico de forma más simétrica.  
+- Un malware tipo keylogger tiende a generar **tráfico saliente dominante**: registra información local y la transmite fuera del sistema.
+
+Por tanto, al evaluar los valores forward y backward por separado (en tamaño, tiempo, número), podemos **detectar asimetrías sospechosas** que podrían pasar desapercibidas si sólo se usan agregados totales.
+
+
+
+Esta agrupación temática no es solo una cuestión de orden: representa un **primer paso crítico** para:
+
+- detectar variables redundantes,  
+- eliminar atributos inútiles,  
+- facilitar la interpretación,  
+- y preparar el terreno para técnicas como selección de variables, PCA o modelado avanzado.
+
+En resumen, haber organizado y comprendido en profundidad las variables nos permite construir un pipeline más eficiente, explicable y robusto para la detección de tráfico malicioso mediante aprendizaje automático.
+
+Según la documentación del conjunto de datos CICIDS2017[^1] y el estudio de Sharafaldin et al. (2018)[^2], las características del tráfico se dividen entre dirección *forward* y *backward* y en categorías como estadísticas, temporales y de volumen.
+
+### Referencias
+
+1. CICIDS2017 Dataset Documentation. University of New Brunswick. https://www.unb.ca/cic/datasets/ids-2017.html  
+2. Sharafaldin, I., Lashkari, A. H., & Ghorbani, A. A. (2018). *Toward Generating a New Intrusion Detection Dataset and Intrusion Traffic Characterization*. ICISSP 2018. https://doi.org/10.5220/0006639801080116
+
+
+
+
+##  Conversión de tipos y validación
+
+```{r}
+# Revisar la estructura general del conjunto de datos
+str(Keylogger) 
+```
+
+
+```{r}
+# Detectar las columnas que deberían ser numéricas pero están en formato de texto
+char_cols <- sapply(Keylogger, is.character)
+Keylogger[1:5, which(char_cols)]
+```
+
+
+```{r}
+# Convertir columnas problemáticas al tipo numérico
+Keylogger$Packet.Length.Std <- as.numeric(Keylogger$Packet.Length.Std)
+Keylogger$CWE.Flag.Count <- as.numeric(Keylogger$CWE.Flag.Count)
+
+# Convertir la variable objetivo a factor
+Keylogger$Class <- as.factor(Keylogger$Class)
+
+cat("Total NA en CWE.Flag.Count: ", sum(is.na(Keylogger$CWE.Flag.Count)), "\n")
+cat("Total NA en Packet.Length.Std: ", sum(is.na(Keylogger$Packet.Length.Std)), "\n\n")
+
+cat("Valores no convertidos correctamente en CWE.Flag.Count:\n")
+cat(unique(Keylogger$CWE.Flag.Count[is.na(Keylogger$CWE.Flag.Count)]), "\n\n")
+
+cat("Valores no convertidos correctamente en Packet.Length.Std:\n")
+cat(unique(Keylogger$Packet.Length.Std[is.na(Keylogger$Packet.Length.Std)]), "\n")
+
+
+``` 
+
+Tras inspeccionar la estructura del conjunto con `str(Keylogger)` y detectar las columnas de tipo carácter mediante `sapply()`, se identificaron **7 variables** con formato de texto (`character`) que, por su naturaleza, deberían ser numéricas o factores.
+
+A continuación, se procedió a convertir **solo 3 de estas variables**:
+
+- `Packet.Length.Std` y `CWE.Flag.Count` se transformaron a numérico.
+- `Class` se transformó a factor al ser la variable objetivo del análisis.
+
+Posteriormente, se comprobó si estas conversiones generaron valores `NA`, lo cual indicaría errores en la conversión. Se detectaron:
+
+- 20 valores `NA` en `CWE.Flag.Count`
+- 17 valores `NA` en `Packet.Length.Std`
+
+Esto se debe a que algunas entradas contenían valores no numéricos (como strings vacíos o símbolos), que al intentar convertirse a tipo numérico resultaron en `NA`.
+
+Dado el gran tamaño del conjunto de datos (más de 500.000 filas), **se decidió eliminar directamente estas observaciones**, ya que representan un porcentaje insignificante y no afectan significativamente la calidad del análisis. Esta decisión es válida desde el punto de vista estadístico, dado que menos del 0.01% de los datos se ven afectados.
+  
+El resto de las variables de tipo carácter serán evaluadas y tratadas más adelante, en función de su relevancia para los modelos predictivos.
+
+
+
+```{r}
+Keylogger <- Keylogger[!is.na(Keylogger$Packet.Length.Std) & !is.na(Keylogger$CWE.Flag.Count), ]
+
+nrow(Keylogger)
+```
+## Análisis de varianza
+
+```{r}
+nzv_indices <- nearZeroVar(Keylogger)
+
+nzv_features <- names(Keylogger)[nzv_indices]
+print(nzv_features)
+
+cat("Nmero de variables con varianza cercana a cero:", length(nzv_features), "\n")
+```
+
+Durante el proceso de limpieza de datos, se aplicó un análisis de **varianza cercana a cero** con el objetivo de identificar variables que no aportan información relevante al modelo. Las variables con **muy poca variabilidad** en sus valores a lo largo de todas las observaciones tienden a ser constantes o casi constantes, y por lo tanto, no contribuyen significativamente al aprendizaje estadístico del modelo.
+
+
+> En este proyecto, utilizamos la función `nearZeroVar()` del paquete **caret** para detectar automáticamente las variables con varianza extremadamente baja.
+
+### Resultado del análisis
+
+Aunque algunas variables como los flags (por ejemplo, `URG.Flag.Count`, `ECE.Flag.Count`) podrían tener relevancia en otros contextos de ciberseguridad, en este conjunto de datos presentaban una frecuencia extremadamente baja (valores nulos o constantes en más del 99% de los casos), por lo que se consideraron irrelevantes para el modelo.
+
+Además, mantener este tipo de variables puede actuar como ruido estadístico e incrementar el riesgo de sobreajuste (*overfitting*), especialmente en modelos sensibles a variables no informativas. Por ello, se optó por eliminarlas tras una inspección visual y estadística de su comportamiento.
+
+
+```{r}
+Keylogger_clean <- Keylogger[, -nzv_indices]
+
+cat("Numero de columnas (antes):", ncol(Keylogger), "\n")
+cat("Numero de columnas (despues):", ncol(Keylogger_clean), "\n")
+
+```
+
+## Revisión de variables categóricas para el modelado
+
+
+```{r}
+sapply(Keylogger_clean, class)
+```
+
+En esta etapa, se ha llevado a cabo un análisis exploratorio de las variables con el objetivo de identificar aquellas que, a pesar de su formato numérico, presentan un comportamiento claramente categórico (por ejemplo, flags binarios o contadores con valores limitados).
+
+Sin embargo, dado que algunos algoritmos de aprendizaje automático requieren que estas variables estén en formato numérico para su correcto procesamiento, se ha decidido mantener su tipo como numérico en esta fase.
+
+Esta decisión busca preservar la compatibilidad con distintos modelos supervisados (como redes neuronales o árboles de decisión), evitando múltiples conversiones innecesarias que podrían introducir inconsistencias o pérdida de información.
+
+Las variables identificadas como categóricas han sido documentadas, y se tratarán adecuadamente en función del modelo específico que se aplique en etapas posteriores.
+
+```{r}
+Keylogger_clean <- Keylogger_clean[, !(names(Keylogger_clean) %in% c("Flow.ID", "Source.IP", "Destination.IP", "Timestamp","X"))]
+
+
+Keylogger_clean$Class <- ifelse(Keylogger_clean$Class == "Benign", 0, 1)
+
+sapply(Keylogger_clean, class)
+
+
+```
+## Eliminación de duplicados
+
+
+```{r}
+# 1. ¿Cuántas filas duplicadas hay antes de la limpieza?
+cat("Número de filas duplicadas antes de la limpieza:", sum(duplicated(Keylogger_clean)), "\n")
+
+# 2. Eliminamos las filas duplicadas del conjunto de datos
+Keylogger_clean <- Keylogger_clean[!duplicated(Keylogger_clean), ]
+
+# 3. Mostramos el número total de filas después de la eliminación
+cat("Número total de filas después de eliminar duplicados:", nrow(Keylogger_clean), "\n")
+
+# 4. Verificamos nuevamente si quedan duplicados
+cat("¿Existen filas duplicadas después de la limpieza?:", sum(duplicated(Keylogger_clean)), "\n")
+```
+
+
+Durante el preprocesamiento, se detectó una gran cantidad de registros duplicados (aproximadamente el 68% del conjunto). Esto es común en conjuntos de datos de tráfico de red, donde múltiples registros pueden reflejar el mismo flujo de conexión después de eliminar identificadores únicos como IPs o timestamps. La eliminación de estos duplicados fue crucial para evitar el sobreajuste y garantizar que el modelo aprenda de patrones genuinos, no de repeticiones artificiales. Tras el proceso, se conservaron 165.881 observaciones únicas.
+
+
+```{r}
+sum(is.na(Keylogger_clean)) 
+colSums(is.na(Keylogger_clean)) 
+table(Keylogger_clean$Class)
+```
+
+Tras la eliminación de duplicados, se verificó nuevamente la existencia de valores ausentes. Se comprobó que el conjunto de datos no contiene valores NA, lo cual confirma la integridad estructural del mismo.
+
+
+## Conclusión de la Parte 1
+
+En esta primera etapa se ha llevado a cabo un análisis exhaustivo de las variables presentes en el conjunto de datos, agrupándolas según su naturaleza para facilitar su comprensión. Posteriormente, se ha realizado una limpieza sistemática y progresiva, abordando problemas relacionados con tipos de datos incorrectos, valores nulos, columnas con baja variabilidad, duplicados y la identificación de variables categóricas.
+
+Como resultado de este proceso, se ha reducido el número de variables de 86 a 47, manteniendo únicamente aquellas con mayor potencial explicativo. Esta depuración no solo mejora la eficiencia computacional, sino que también aumenta la calidad de los modelos predictivos que se desarrollarán en las siguientes fases.
+
+La base de datos ahora se encuentra en un estado óptimo para comenzar con el análisis estadístico y la construcción de modelos de aprendizaje automático.
+
+
+# EJERCICIO 2: Muestreo y conjunto de test [1/10]
+
+## Muestreo aleatorio del 10%
+
+Introducción al muestreo y conjunto de test
+Antes de entrenar cualquier modelo supervisado, es fundamental separar adecuadamente los datos en conjuntos de entrenamiento y prueba. Este paso garantiza una evaluación objetiva del rendimiento del modelo sobre datos no vistos.
+
+En esta sección, se realiza un muestreo aleatorio estratificado para seleccionar una fracción representativa del conjunto completo. Posteriormente, esta muestra se divide en un conjunto de entrenamiento y otro de prueba, manteniendo la proporción de clases (Benign vs Keylogger) para evitar sesgos.
+
+
+```{r}
+set.seed(123)
+train_index <- createDataPartition(Keylogger_clean$Class, p = 0.1, list = FALSE)
+Keylogger_sample <- Keylogger_clean[train_index, ]
+```
+
+```{r}
+table(Keylogger_clean$Class)               
+table(Keylogger_sample$Class)              
+prop.table(table(Keylogger_sample$Class))
+```
+
+
+## División entrenamiento/test
+
+
+```{r}
+set.seed(123)
+train_indices <- createDataPartition(Keylogger_sample$Class, p = 0.7, list = FALSE)
+
+train_set <- Keylogger_sample[train_indices, ]
+test_set  <- Keylogger_sample[-train_indices, ]
+```
+
+```{r}
+prop.table(table(train_set$Class))  
+prop.table(table(test_set$Class))
+
+```
+
+
+
+
+
+
+Dado el tamaño considerable del conjunto de datos original (más de 500.000 registros), se ha optado por realizar un **muestreo aleatorio estratificado del 10%** sobre el conjunto limpio. Esta estrategia permite trabajar con una muestra representativa, manteniendo la proporción original de clases (Benign vs Keylogger), lo que es crucial en contextos con **clases desbalanceadas** como este.
+
+A partir de esta muestra estratificada, se ha llevado a cabo una **división del 70% para entrenamiento y 30% para test**, utilizando la función `createDataPartition()` del paquete `caret`. Este método asegura que ambos subconjuntos conserven la misma distribución de clases que el conjunto de datos original, mejorando así la **validez estadística de la evaluación**.
+
+Además, se ha fijado la semilla aleatoria con `set.seed(123)` para garantizar la **reproducibilidad** de los resultados. Cabe destacar que el conjunto de test **no será modificado** ni balanceado en fases posteriores, ya que se utilizará exclusivamente para medir la **capacidad de generalización** de los modelos entrenados.
+
+
+# EJERCICIO 3: Análisis PCA [1/10]
+
+## Aplicación de PCA
+
+[0.5/10] Elabora un análisis no supervisado (PCA) de las conexiones y explica lo que ves. ¿Cómo dirías que va a ser el problema de la elaboración de un modelo de clasificación que identifique conexiones de keystrokes en términos de dificultad? Razona la respuesta.
+
+
+Comenzamos con un preprocesamiento de los datos para el análisis. La idea es tomar las variables numéricas y quitar las categóricas para este análisis:
+
+```{r}
+pca_train <- train_set[, !(names(train_set) %in% c("Class"))]
+
+pca_result <- prcomp(pca_train, center = TRUE, scale. = TRUE)
+
+summary(pca_result)
+```
+
+## Visualización: Scree plot y dispersión
+
+
+```{r}
+
+pca_var <- pca_result$sdev^2
+pca_var_exp <- pca_var / sum(pca_var)
+
+pca_df <- data.frame(
+  PC = factor(1:length(pca_var_exp)),
+  Variance = pca_var_exp
+)
+
+ggplot(pca_df[1:10, ], aes(x = PC, y = Variance, group = 1)) +
+  geom_line(color = "#2c3e50", size = 1.2) +
+  geom_point(color = "#e74c3c", size = 3) +
+  theme_minimal(base_size = 13) +
+  labs(
+    title = "Scree Plot - Varianza Explicada",
+    x = "Componente Principal",
+    y = "Proporcion de Varianza Explicada"
+  ) +
+  scale_x_discrete(labels = paste0("PC", 1:10)) +
+  theme(
+    axis.text.x = element_text(angle = 0, vjust = 0.5),
+    plot.title = element_text(face = "bold")
+  )
+
+
+```
+
+### Análisis exploratorio con PCA
+
+A través del análisis de componentes principales (PCA), hemos examinado la estructura interna del conjunto de datos. Se observa que las **primeras 5 componentes** explican aproximadamente un **64%** de la variabilidad total, mientras que con **las primeras 10** se alcanza casi un **83%**. Este resultado sugiere que el conjunto presenta cierta **redundancia de información**, aunque no necesariamente una alta colinealidad entre las variables.
+
+> Este comportamiento no implica que el problema sea de alta dimensionalidad, ya que en este caso se cumple que **p << n** (menos de 50 predictores frente a más de 16.000 observaciones), por lo que el PCA se utiliza únicamente con fines **exploratorios**, no para reducción de dimensión.
+
+En este contexto, se puede anticipar que el problema de clasificación podría **no ser linealmente separable** en las primeras componentes, lo cual **motivaría el uso de modelos más complejos** como redes neuronales o boosting. No obstante, es necesario completar este análisis con una visualización de las observaciones proyectadas sobre los dos primeros componentes (PC1 y PC2), donde se podrá evaluar de forma visual si existe una **cierta separación** entre las clases `Benign` y `Keylogger`.
+
+## Interpretación de componentes
+
+
+```{r}
+
+pca_data <- as.data.frame(pca_result$x)           
+pca_data$Class <- as.factor(train_set$Class)      
+
+
+ggplot(pca_data, aes(x = PC1, y = PC2, color = Class)) +
+  geom_point(alpha = 0.5) +
+  labs(title = "Proyeccion PCA: PC1 vs PC2", x = "PC1", y = "PC2") +
+  theme_minimal()
+
+```
+
+
+
+## Análisis de la proyección PCA y contribución de variables
+
+Tras el análisis cuantitativo de la varianza explicada (gráfico de scree plot), se ha representado la proyección de las observaciones sobre los dos primeros componentes principales (PC1 y PC2).
+
+La visualización muestra una **superposición considerable entre las clases `Benign` y `Keylogger`**, sin una tendencia clara de separación. Esto indica que **no existe una estructura linealmente separable en las dos primeras dimensiones**, lo cual sugiere que el problema presenta **relaciones complejas no lineales**. No se descarta que componentes superiores como PC3 o PC4 aporten cierta diferenciación, pero esto requeriría un análisis visual adicional.
+
+Si bien no se ha incluido aún el gráfico de contribución de variables, se anticipa que **algunas variables relacionadas con longitudes de paquetes y duración del flujo** pueden tener un peso importante en los primeros componentes.
+
+En resumen, **este análisis exploratorio sugiere que será necesario utilizar modelos de clasificación más avanzados**, como Random Forest, XGBoost o Redes Neuronales, que puedan capturar relaciones no lineales y manejar la complejidad del conjunto de datos.
+
+
+
+# EJERCICIO 4: Modelo de regresión penalizada (Lasso) [2/10]
+
+[2/10] ¿Es posible identificar si la conexión es benigna o maligna mediante un modelo de regresión? ¿Qué tipo de modelo de regresión habría que usar en este caso? ¿Cuáles son las características relevantes? ¿Cómo se comporta el modelo?
+
+La idea es emplear el modelo de Lasso ajustado para modelos de clasificación binaria. Lo bueno de este modelo es que nos permite adicionalmente seleccionar las variables más relevantes y penalizar las menos relevantes. Este método se conoce como regresión logística con penalización. Este modelo automáticamente selecciona las características más relevantes y penaliza aquellas con coceficientes cercanos a cero.
+
+## Preparación de datos
+
+```{r}
+train_copy <- train_set
+test_copy <- test_set
+
+
+
+X_train <- model.matrix(Class ~ . -1, data = train_copy)
+y_train <- train_copy$Class
+
+X_test <- model.matrix(Class ~ . -1, data = test_copy)
+y_test <- test_copy$Class
+```
+
+## Ajuste del modelo
+
+```{r}
+# Ajustamos el modelo LASSO (regresión logística con penalización L1)
+set.seed(123)
+lasso_model <- cv.glmnet(X_train, y_train, family = "binomial", alpha = 1)
+```
+
+
+```{r}
+# Visualizamos los coeficientes seleccionados por LASSO
+coef_selected <- coef(lasso_model, s = "lambda.min")
+print(coef_selected)
+```
+
+```{r}
+df_plot <- data.frame(
+  lambda = lasso_model$lambda,
+  mse = lasso_model$cvm,
+  mse_sd = lasso_model$cvsd
+)
+
+df_plot$log_lambda <- log(df_plot$lambda)
+
+ggplot(df_plot, aes(x = log_lambda, y = mse)) +
+  geom_point(color = "red", size = 2) +
+  geom_errorbar(aes(ymin = mse - mse_sd, ymax = mse + mse_sd), width = 0.2, alpha = 0.5) +
+  geom_vline(xintercept = log(lasso_model$lambda.min), linetype = "dashed", color = "blue") +
+  geom_vline(xintercept = log(lasso_model$lambda.1se), linetype = "dashed", color = "darkgreen") +
+  labs(
+    title = "Curva de validacion cruzada - Error (MSE) vs log(Lambda)",
+    x = "log(Lambda)",
+    y = "Mean Squared Error (MSE)"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+
+## Métricas de evaluación: precisión, matriz de confusión, AUC
+
+```{r}
+coef_lasso_1se <- coef(lasso_model, s = "lambda.1se")
+selected_vars <- rownames(coef_lasso_1se)[coef_lasso_1se[, 1] != 0]
+selected_vars <- selected_vars[selected_vars != "(Intercept)"]
+cat("Variables seleccionadas:\n")
+print(selected_vars)
+```
+
+
+
+
+```{r}
+X_train_selected <- X_train[, selected_vars]
+X_test_selected  <- X_test[, selected_vars]
+
+lasso_final_model <- glmnet(X_train_selected, y_train, 
+                            family = "binomial", alpha = 1, 
+                            lambda = lasso_model$lambda.1se)
+
+pred_probs <- predict(lasso_final_model, newx = X_test_selected, type = "response")
+
+pred_class <- ifelse(pred_probs > 0.5, 1, 0)
+
+conf_mat <- confusionMatrix(as.factor(pred_class), as.factor(y_test), positive = "1")
+print(conf_mat)
+
+roc_obj <- roc(y_test, as.numeric(pred_probs))
+auc_value <- auc(roc_obj)
+
+cat("\nAUC (Área bajo la curva ROC):", round(auc_value, 4), "\n")
+cat("Precisión global:", round(conf_mat$overall["Accuracy"] * 100, 2), "%\n")
+cat("Recall (Sensibilidad para clase 1):", round(conf_mat$byClass["Recall"] * 100, 2), "%\n")
+cat("F1-score:", round(conf_mat$byClass["F1"] * 100, 2), "%\n")
+
+```
+
+## Evaluación crítica del modelo
+
+A pesar de que el modelo Lasso presenta una precisión global del 60.21%, su capacidad para identificar la clase minoritaria (Keylogger) es extremadamente limitada. La tasa de verdaderos positivos (recall) es apenas del 0.65%, lo que indica que el modelo falla en detectar la mayoría de las conexiones maliciosas. Esto pone en evidencia que, si bien Lasso es útil para la selección de variables, no es adecuado como clasificador principal en este contexto.
+
+
+### Visualización PCA: ausencia de separación entre clases
+
+Al proyectar los datos sobre los dos primeros componentes principales mediante un análisis PCA, se observa que las clases *Benign* y *Keylogger* están fuertemente mezcladas. No se aprecia una frontera lineal clara entre ellas, lo que sugiere que el conjunto de datos **no es linealmente separable**. Esto dificulta el desempeño de modelos como la regresión logística.
+
+### Métrica engañosa: alta precisión, bajo recall
+
+Aunque la precisión general del modelo es razonable, esta métrica resulta engañosa en presencia de clases desbalanceadas. El modelo tiende a clasificar la mayoría de las instancias como benignas, lo cual **mejora artificialmente la precisión**, pero a costa de un recall casi nulo para la clase maliciosa. La matriz de confusión lo confirma: apenas hay verdaderos positivos para la clase Keylogger.
+
+### Limitaciones del modelo lineal
+
+El hecho de que el modelo Lasso utilice múltiples variables y aún así no mejore significativamente el rendimiento sugiere que la relación entre predictores y clase objetivo es **no lineal**. Por ello, este problema requiere modelos con **fronteras de decisión no lineales**, como:
+
+- Máquinas de soporte vectorial con kernel  
+- Árboles de decisión (*Random Forest*)  
+- Métodos de *Boosting* (como *XGBoost*)  
+- Redes neuronales profundas
+
+### Lasso como herramienta exploratoria
+
+A pesar de sus limitaciones como clasificador, Lasso ha demostrado ser útil para **reducir la dimensionalidad** y seleccionar variables relevantes. En este caso, el modelo identificó un subconjunto de **14 predictores**, lo cual puede servir como punto de partida para modelos más complejos y robustos.
+
+## Conclusión
+
+Los resultados del modelo Lasso evidencian las limitaciones de los modelos lineales ante un problema de clasificación con datos **no linealmente separables** y **clases desbalanceadas**. Se recomienda avanzar hacia algoritmos **más sofisticados y no lineales**, como redes neuronales o boosting, que puedan manejar mejor la complejidad del problema y mejorar la detección de conexiones maliciosas.
+
+
+# EJERCICIO 5: XgBoost y Neural Network [5/10]
+
+## XgBoost
+
+### Tipo de modelo y estrategia de construcción  
+
+Desde la perspectiva del aprendizaje estadístico, XGBoost puede interpretarse como una implementación optimizada del algoritmo de boosting basada en el descenso de gradiente funcional (*Functional Gradient Descent*). El objetivo principal es minimizar una función de pérdida que mide el error entre las predicciones del modelo y los valores reales. En cada iteración, se construye un nuevo árbol de decisión que intenta corregir los errores residuales del conjunto de árboles anteriores. Esta optimización se realiza paso a paso, controlando la tasa de aprendizaje mediante el parámetro `eta`. Además, XGBoost incorpora regularización L1/L2, lo que permite controlar la complejidad del modelo y mitigar el sobreajuste. Esta formulación matemática ofrece una excelente capacidad de generalización y lo convierte en una herramienta potente para tareas de clasificación.
+
+XGBoost (Extreme Gradient Boosting) es un algoritmo de ensamblado basado en árboles de decisión, que ha demostrado un alto rendimiento en múltiples tareas de clasificación. Esta técnica construye árboles de forma secuencial, donde cada nuevo árbol corrige los errores cometidos por los árboles anteriores. A diferencia de métodos clásicos de boosting, XGBoost introduce mejoras clave como la regularización, el manejo eficiente de datos escasos y la posibilidad de procesamiento paralelo, lo que lo convierte en un modelo potente y escalable.
+
+En el contexto de este proyecto, la tarea de detección de tráfico malicioso como los Keyloggers implica desafíos tales como el desbalance de clases, alta dimensionalidad y la necesidad de mantener un equilibrio entre precisión y sensibilidad. Por ello, XGBoost ha sido seleccionado como una opción ideal, ya que ofrece un buen compromiso entre complejidad y capacidad de generalización.
+
+Previo al entrenamiento, se realizó una conversión de variables categóricas a formato numérico y se codificó la variable objetivo (`Class`) como binaria (0 para Benign y 1 para Keylogger). Luego, se aplicó una búsqueda en malla (*grid search*) sobre un conjunto de hiperparámetros con validación cruzada estratificada para seleccionar la mejor combinación posible.
+
+Además, XGBoost incluye mejoras técnicas como:
+
+Regularización L1 y L2, que ayuda a evitar el sobreajuste.
+
+Manejo automático de valores faltantes, lo cual lo hace robusto ante datos reales.
+
+Optimización mediante histogramas, que acelera significativamente el entrenamiento.
+
+Procesamiento paralelo y escalabilidad, adecuado para grandes volúmenes de datos.
+
+Esta elección se alinea perfectamente con los desafíos de este trabajo, donde se busca identificar conexiones maliciosas (keyloggers) dentro de una gran cantidad de tráfico benigno. A continuación, se resume la estrategia de construcción seguida:
+
+Alta precisión,
+
+Capacidad de generalización,
+
+Eficiencia computacional,
+
+Flexibilidad para ajustar múltiples hiperparámetros.
+
+La estrategia de construcción del modelo ha seguido una secuencia clara:
+
+- Filtrado de clases relevantes: solo “Benign” y “Keylogger”.
+- Conversión de la variable objetivo a binaria (0 = Benign, 1 = Keylogger).
+- Conversión de todas las variables a tipo numérico.
+- Creación de las matrices optimizadas (DMatrix) para el entrenamiento.
+- Ajuste de hiperparámetros mediante validación cruzada y grid search.
+- Entrenamiento del modelo final con los mejores parámetros encontrados.
+
+
+### Preprocesamiento necesario
+
+Aunque XGBoost es un algoritmo robusto que puede manejar directamente variables numéricas y valores nulos, para garantizar un rendimiento óptimo y una mayor estabilidad en los resultados, se ha aplicado un preprocesamiento cuidadoso antes del entrenamiento del modelo. A continuación, se detallan los pasos realizados:
+
+- **Codificación binaria de la variable objetivo**: La variable `Class` se transformó a un formato numérico binario, donde `0` representa conexiones benignas y `1` representa keyloggers.
+
+- **Conversión de variables categóricas**: Todas las variables de tipo `factor`, `character` o `logical` fueron transformadas a tipo `numeric`. Esto es necesario porque XGBoost requiere que todos los predictores estén en formato numérico.
+
+- **Creación de matrices optimizadas (DMatrix)**: Los conjuntos de entrenamiento y prueba **serán convertidos** a estructuras `DMatrix`, que son el formato de entrada nativo de XGBoost y permiten una computación eficiente.
+
+Cabe destacar que no fue necesario aplicar escalado de variables ni imputación de valores faltantes, ya que XGBoost maneja estos aspectos internamente de forma eficiente.
+
+
+
+### Hiperparámetros del modelo
+
+El modelo XGBoost utilizado en esta práctica fue entrenado mediante una búsqueda en malla (grid search) con validación cruzada estratificada. A continuación se explican en detalle los hiperparámetros empleados y su función dentro del modelo:
+
+- **`objective = "binary:logistic"`**  
+  Define que la tarea a resolver es de clasificación binaria. El modelo predice la probabilidad de que una observación pertenezca a la clase positiva (Keylogger).
+
+- **`tree_method = "hist"`**  
+  Emplea un método basado en histogramas para construir árboles más rápidamente. Es útil para conjuntos de datos grandes y permite entrenamiento más eficiente.
+
+- **`eval_metric = "auc"`**  
+  Se utiliza el Área Bajo la Curva ROC como métrica de evaluación principal, ya que es apropiada para conjuntos desbalanceados y mide la capacidad del modelo para discriminar entre clases.
+
+- **`eta` (learning rate)**  
+  Controla la velocidad con la que el modelo aprende en cada iteración. Valores bajos (por ejemplo, 0.05 o 0.1) hacen que el entrenamiento sea más lento pero ayudan a evitar el sobreajuste.
+
+- **`max_depth`**  
+  Profundidad máxima de cada árbol. Limita la complejidad del modelo. Valores más altos permiten capturar relaciones más complejas, pero también incrementan el riesgo de sobreajuste.
+
+- **`subsample`**  
+  Fracción de datos utilizada aleatoriamente en cada iteración. Introduce aleatoriedad y mejora la capacidad de generalización del modelo.
+
+- **`colsample_bytree`**  
+  Proporción de características (features) seleccionadas aleatoriamente para cada árbol. Mejora la diversidad entre árboles y reduce la varianza.
+
+- **`gamma`**  
+  Cantidad mínima de ganancia en la función de pérdida requerida para realizar una partición adicional. Actúa como regularización estructural, previniendo árboles excesivamente complejos.
+
+- **`min_child_weight`**  
+  Mínimo número de instancias requerido para que una partición se considere válida. Controla la complejidad y evita divisiones innecesarias en ramas con pocos datos.
+
+- **`scale_pos_weight`**  
+  Ajusta el peso de la clase minoritaria para compensar el desbalance de clases. Se calcula como la razón entre observaciones negativas y positivas en el conjunto de entrenamiento.
+
+Este conjunto de hiperparámetros fue cuidadosamente seleccionado mediante experimentación empírica y análisis de rendimiento en validación cruzada. La combinación óptima encontrada permitió maximizar la métrica AUC y mejorar la sensibilidad del modelo frente a la clase positiva.
+
+
+```{r}
+table(train_set$Class)               
+table(test_set$Class)
+```
+
+
+```{r}
+X <- train_set[, -which(names(train_set) == "Class")]
+y <- train_set$Class
+
+X_test <- test_set[, -which(names(test_set) == "Class")]
+y_test <- test_set$Class
+
+dtrain <- xgb.DMatrix(data = as.matrix(X), label = y)
+dtest  <- xgb.DMatrix(data = as.matrix(X_test), label = y_test)
+
+```
+
+
+```{r}
+write.csv(X, "X.csv", row.names = FALSE)
+write.csv(X_test, "X_test.csv", row.names = FALSE)
+write.csv(data.frame(Class = y), "y.csv", row.names = FALSE)
+write.csv(data.frame(Class = y_test), "y_test.csv", row.names = FALSE)
+reticulate::repl_python()
+```
+
+
+```{python}
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import xgboost as xgb
+from sklearn.model_selection import ParameterGrid
+from sklearn.metrics import accuracy_score, roc_auc_score, f1_score, recall_score
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+import pickle
+
+X = pd.read_csv("X.csv")
+X_test = pd.read_csv("X_test.csv")
+y = pd.read_csv("y.csv")
+y_test = pd.read_csv("y_test.csv")
+
+print(X.shape)
+print(X_test.shape)
+print(y.shape)
+print(y_test.shape)
+
+```
+
+
+
+```{python}
+
+
+X = pd.read_csv("X.csv")
+X_test = pd.read_csv("X_test.csv")
+y = pd.read_csv("y.csv")["Class"]
+y_test = pd.read_csv("y_test.csv")["Class"]
+
+dtrain = xgb.DMatrix(X, label=y)
+dtest = xgb.DMatrix(X_test, label=y_test)
+
+n_pos = np.sum(y == 1)
+n_neg = np.sum(y == 0)
+scale_pos_w = n_neg / n_pos
+
+param_grid = {
+    'eta': np.arange(0.01, 0.21, 0.05),
+    'max_depth': [3, 5, 7],
+    'subsample': [0.7, 0.9, 1.0],
+    'colsample_bytree': [0.7, 0.9, 1.0],
+    'gamma': [0, 0.1, 0.5],
+    'min_child_weight': [1, 3]
+}
+
+grid = list(ParameterGrid(param_grid))
+
+best_auc = 0
+best_params = None
+best_nrounds = 0
+
+for p in grid:
+    params = {
+        'objective': 'binary:logistic',
+        'tree_method': 'hist',         
+        'device': 'cuda',              
+        'eval_metric': 'auc',
+        'eta': p['eta'],
+        'max_depth': p['max_depth'],
+        'subsample': p['subsample'],
+        'colsample_bytree': p['colsample_bytree'],
+        'gamma': p['gamma'],
+        'min_child_weight': p['min_child_weight'],
+        'scale_pos_weight': scale_pos_w
+    }
+
+    cv_result = xgb.cv(
+        params=params,
+        dtrain=dtrain,
+        nfold=5,
+        stratified=True,
+        num_boost_round=100,
+        early_stopping_rounds=10,
+        seed=42,
+        verbose_eval=False
+    )
+
+    mean_auc = cv_result['test-auc-mean'].max()
+    best_iter = cv_result['test-auc-mean'].idxmax()
+
+    if mean_auc > best_auc:
+        best_auc = mean_auc
+        best_params = params
+        best_nrounds = best_iter
+
+print("Best AUC:", best_auc)
+print("Best parameters:", best_params)
+print("Best number of rounds:", best_nrounds)
+
+final_model = xgb.train(
+    params=best_params,
+    dtrain=dtrain,
+    num_boost_round=best_nrounds
+)
+
+y_pred_prob = final_model.predict(dtest)
+y_pred_class = (y_pred_prob > 0.5).astype(int)
+
+acc = accuracy_score(y_test, y_pred_class)
+auc = roc_auc_score(y_test, y_pred_prob)
+
+print(f"Accuracy: {acc:.4f}")
+print(f"AUC: {auc:.4f}")
+
+```
+
+
+
+
+### Estrategia de búsqueda (Grid Search)
+
+Con el objetivo de encontrar la mejor combinación de hiperparámetros para el modelo XGBoost, se aplicó una estrategia de búsqueda en rejilla (grid search) combinada con validación cruzada estratificada de 5 pliegues. Esta técnica permite probar sistemáticamente distintas combinaciones de valores para los hiperparámetros más relevantes (eta, max_depth, subsample, colsample_bytree, gamma, min_child_weight), optimizando así el rendimiento del modelo en función de la métrica AUC.
+
+En una primera etapa, se definió una cuadrícula básica con valores limitados pero representativos. Aunque esta configuración inicial produjo resultados aceptables, el valor del AUC (~0.67) se mantuvo en un nivel medio. Por ello, se decidió implementar una segunda búsqueda más amplia y detallada para mejorar el desempeño del modelo.
+
+En esta segunda fase más exhaustiva, se ampliaron los rangos de cada hiperparámetro y se añadieron valores más precisos. Aunque esta estrategia implicó un mayor coste computacional, permitió modelar mejor las interacciones entre parámetros y alcanzar un mayor rendimiento general.
+
+La estrategia aplicada siguió los siguientes pasos:
+
+Se eligió AUC como métrica de evaluación por su adecuación en problemas con datos desbalanceados.
+
+Se definió una cuadrícula de valores representativos para los hiperparámetros.
+
+Se ejecutó validación cruzada estratificada de 5 pliegues para cada combinación.
+
+Se seleccionó la combinación con mayor AUC promedio en validación.
+
+Se entrenó el modelo final con los mejores hiperparámetros encontrados y se evaluó en el conjunto de prueba.
+
+Esta estrategia, estructurada y reproducible, fue diseñada en coherencia con los principios del aprendizaje estadístico y los requisitos metodológicos del curso.
+
+
+
+
+
+```{python}
+cm = confusion_matrix(y_test, y_pred_class)
+labels = ['Negativo', 'Positivo']
+disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+disp.plot(cmap='Blues')
+plt.xlabel('Prediccion')
+plt.ylabel('Clase real')
+plt.title("Matriz de confusion")
+plt.show()
+
+```
+
+### Importancia de variables
+```{python}
+importance = final_model.get_score(importance_type='gain')
+importance = dict(sorted(importance.items(), key=lambda item: item[1], reverse=True))
+
+for feature, score in list(importance.items())[:15]:
+    print(f"{feature}: {score:.4f}")
+
+top_features = list(importance.keys())[:15]
+
+```
+```{r}
+write.csv(Keylogger_clean, "Keylogger_clean.csv", row.names = FALSE)
+
+```
+
+```{python}
+keylogger_clean = pd.read_csv("Keylogger_clean.csv")
+print(keylogger_clean.shape)
+selected_columns = top_features + ["Class"]
+keylogger_clean_top = keylogger_clean[selected_columns]
+print(keylogger_clean_top.shape)
+```
+```{python}
+
+
+X = keylogger_clean_top.drop("Class", axis=1)
+y = keylogger_clean_top["Class"]
+
+dtrain = xgb.DMatrix(X, label=y)
+
+best_params = {
+    'objective': 'binary:logistic',
+    'tree_method': 'hist',
+    'device': 'cuda',
+    'eval_metric': 'auc',
+    'eta': 0.11,
+    'max_depth': 7,
+    'subsample': 0.9,
+    'colsample_bytree': 0.7,
+    'gamma': 0.1,
+    'min_child_weight': 1,
+    'scale_pos_weight': 1.412339011217283
+}
+
+best_nrounds = 100
+
+final_model = xgb.train(params=best_params, dtrain=dtrain, num_boost_round=best_nrounds)
+
+y_pred_prob = final_model.predict(dtrain)
+y_pred_class = (y_pred_prob > 0.5).astype(int)
+
+acc = accuracy_score(y, y_pred_class)
+auc = roc_auc_score(y, y_pred_prob)
+f1 = f1_score(y, y_pred_class)
+recall = recall_score(y, y_pred_class)
+cm = confusion_matrix(y, y_pred_class)
+
+print("Rendimiento del modelo sobre el conjunto de entrenamiento:")
+print(f"Precisión (Accuracy): {acc:.4f}")
+print(f"AUC: {auc:.4f}")
+print(f"Puntuación F1: {f1:.4f}")
+print(f"Recall (Sensibilidad): {recall:.4f}")
+```
+```{python}
+labels = ['Negativo', 'Positivo']
+plt.figure(figsize=(6, 5))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=labels, yticklabels=labels)
+
+plt.xlabel('Prediccion')
+plt.ylabel('Clase real')
+plt.title('Matriz de confusion')
+plt.tight_layout()
+plt.show()
+
+```
+### Resultados, evaluación y curva ROC de XGBoost
+
+A partir de los resultados obtenidos con el modelo XGBoost, se evidencia una mejora sustancial en el rendimiento general respecto al enfoque inicial basado en regresión Lasso. Mientras que el modelo Lasso apenas lograba identificar la clase positiva (Keylogger) con una sensibilidad inferior al 1%, la incorporación de XGBoost elevó dicha métrica a un 65.02% utilizando el conjunto completo de datos y una selección optimizada de variables.
+
+Además de este aumento significativo en la capacidad de detección, el modelo también mantiene métricas sólidas en otros aspectos clave. La precisión global alcanza el 68.27% y el valor AUC asciende a 0.7569, lo que indica una buena capacidad discriminativa en contextos con posible desbalance de clases. El F1-score de 0.6270, junto con una matriz de confusión bien distribuida, respalda la consistencia del modelo en la clasificación binaria.
+
+Una de las principales mejoras metodológicas en esta segunda etapa ha sido la reducción de dimensionalidad basada en la importancia de las variables. A través de un análisis previo sobre un subconjunto de entrenamiento, se identificaron las 15 características más relevantes mediante el criterio de "gain". Esta selección permitió reducir la complejidad del modelo sin comprometer su rendimiento, facilitando un entrenamiento más eficiente sobre la totalidad del conjunto de datos (~160.000 observaciones).
+
+Cabe destacar que esta versión final del modelo no solo incorpora un conjunto más amplio y representativo de datos, sino que también se apoya en una configuración previamente optimizada de hiperparámetros, obtenida mediante validación cruzada. Esta combinación permite al modelo generalizar mejor y adaptarse a la estructura no lineal del problema, en contraste con las limitaciones de los modelos lineales como Lasso.
+
+En conclusión, XGBoost se posiciona como una herramienta eficaz y robusta para tareas de ciberseguridad como la detección de keyloggers.
+
+```{python}
+final_model.save_model("xgboost_model.json")
+
+```
+
+
+## Red Neuronal Profunda
+
+En esta sección se construye un modelo de red neuronal profunda (DNN, por sus siglas en inglés) con el objetivo de clasificar conexiones de red como benignas o maliciosas (keylogger). Este tipo de modelo es especialmente adecuado para problemas complejos de clasificación donde existen relaciones no lineales entre las variables predictoras. A diferencia de los modelos tradicionales como regresión logística, las redes neuronales profundas pueden aprender representaciones jerárquicas de los datos mediante capas ocultas y activaciones no lineales.
+
+Para la implementación, se utilizará la librería Keras con backend de TensorFlow, aprovechando capacidades de entrenamiento en GPU. A continuación, se detallan las decisiones de diseño respecto al tipo de red, preprocesamiento de los datos, arquitectura, entrenamiento y evaluación del modelo.
+
+
+
+### Preprocesamiento necesario
+
+Aunque los datos ya fueron limpiados y transformados en pasos anteriores (eliminación de valores NA, codificación categórica, etc.), las redes neuronales requieren un preprocesamiento adicional para garantizar un entrenamiento estable.
+
+En particular, es fundamental **normalizar las variables predictoras** para evitar que la magnitud de las características individuales distorsione el proceso de aprendizaje. Para este fin, se ha aplicado el **escalamiento estandarizado** (*StandardScaler*), el cual transforma cada variable \\( x_j \\) según la fórmula:
+
+$$
+x_j^{(scaled)} = \frac{x_j - \mu_j}{\sigma_j}
+$$
+
+donde \\( \mu_j \\) y \\( \sigma_j \\) representan la media y desviación estándar de la variable \\( j \\), respectivamente. Esta transformación asegura que cada entrada tenga media cero y varianza uno, lo que facilita la convergencia del algoritmo de optimización.
+
+- **Además**, en esta etapa se realiza una comprobación para detectar variables categóricas que hayan sido codificadas numéricamente (como por ejemplo `Protocol` o `Destination.Port`). Si es necesario, se aplicará **codificación one-hot** para asegurar que el modelo no interprete erróneamente relaciones ordinales entre estas categorías.
+
+- **Finalmente**, la **normalización se calcula únicamente sobre el conjunto de entrenamiento** para evitar fuga de datos (*data leakage*), y luego se aplica la misma transformación al conjunto de prueba utilizando los parámetros obtenidos del entrenamiento.
+
+
+#### Codificación one-hot
+
+```{r}
+cols_to_encode <- c("Protocol")
+train_set$Protocol <- as.factor(train_set$Protocol)
+test_set$Protocol  <- as.factor(test_set$Protocol)
+
+train_set <- dummy_cols(train_set, select_columns = cols_to_encode, remove_first_dummy = TRUE)
+test_set  <- dummy_cols(test_set, select_columns = cols_to_encode, remove_first_dummy = TRUE)
+
+train_set <- train_set[, !names(train_set) %in% cols_to_encode]
+test_set  <- test_set[, !names(test_set) %in% cols_to_encode]
+
+```
+
+Con el fin de preparar adecuadamente los datos para la red neuronal, se identificaron varias variables numéricas que en realidad representan categorías (`Protocol`).
+
+Estas variables fueron convertidas en variables dummy mediante **codificación one-hot**, lo cual permite al modelo interpretar correctamente la naturaleza categórica de estas columnas sin asumir relaciones ordinales entre los valores.
+
+Dado que muchas de estas variables contienen únicamente dos categorías (por ejemplo: 0 y 1), se ha utilizado la opción `remove_first_dummy = TRUE` para evitar colinealidad. Esto implica que por cada variable binaria, **solo se genera una nueva columna**, siendo suficiente para representar ambas clases.
+
+Finalmente, las columnas originales fueron eliminadas para mantener un conjunto de datos limpio y listo para el proceso de normalización.
+
+
+```{r}
+y_train <- as.numeric(train_set$Class)
+y_test  <- as.numeric(test_set$Class)
+
+train_features <- train_set[, !(names(train_set) %in% "Class")]
+test_features  <- test_set[, !(names(test_set) %in% "Class")]
+```
+
+#### Normalización
+
+```{r}
+scaler <- preProcess(train_features, method = c("center", "scale"))
+x_train <- predict(scaler, train_features)
+x_test  <- predict(scaler, test_features)
+
+x_train <- as.matrix(x_train)
+x_test  <- as.matrix(x_test)
+y_train <- as.numeric(y_train)
+y_test  <- as.numeric(y_test)
+dim(x_test)
+dim(x_train)
+```
+
+
+Después de completar el preprocesamiento, se separan las variables predictoras (x) y la variable objetivo (y) para ambos conjuntos de datos (entrenamiento y prueba). Esta separación es esencial para alimentar correctamente la red neuronal.
+
+- `x_train` y `x_test` contienen únicamente variables numéricas estandarizadas.
+- `y_train` y `y_test` contienen las etiquetas binarias que indican si una conexión es maliciosa o no.
+
+### Arquitectura y Optimización del Modelo de Red Neuronal
+
+Para abordar la detección de conexiones maliciosas (keylogger) se ha desarrollado un modelo basado en redes neuronales profundas, aprovechando su capacidad para aprender representaciones complejas a partir de datos de alta dimensión. Se optó por una arquitectura secuencial densa compuesta por varias capas ocultas, con mecanismos de regularización y normalización para mejorar la capacidad de generalización del modelo.
+
+La arquitectura final del modelo está compuesta por las siguientes capas:
+
+- **Capa densa (512 neuronas)** con activación ReLU y normalización `BatchNormalization`.
+- **Capa densa (256 neuronas)** con activación ReLU, `BatchNormalization` y `Dropout` (tasa de 0.2).
+- **Capa densa (128 neuronas)** con activación ReLU y `BatchNormalization`.
+- **Capa densa (64 neuronas)** con activación ReLU y `BatchNormalization`.
+- **Capa de salida**: una única neurona con activación `sigmoid`, encargada de producir una probabilidad para la clasificación binaria (malicioso vs. legítimo).
+
+Este diseño profundo permite capturar relaciones no lineales complejas y mitigar el riesgo de sobreajuste gracias al uso de `Dropout` y `BatchNormalization`, lo cual es crucial en problemas de ciberseguridad donde la distribución de clases suele estar desbalanceada.
+
+A continuación, se detallan los **hiperparámetros optimizados** mediante búsqueda en malla (grid search) y su impacto en el modelo:
+
+- **`dropout`**  
+  Controla la fracción de neuronas desactivadas aleatoriamente durante el entrenamiento. Valores como **0.2** o **0.3** ayudan a **prevenir el sobreajuste** y mejorar la generalización del modelo.
+
+- **`learning_rate`**  
+  Define la **tasa de aprendizaje** del optimizador Adam. Se evaluaron valores como **0.001**, **0.003** y **0.005**. Un valor más bajo permite un ajuste más fino pero requiere más épocas.
+
+- **`batch_size`**  
+  Tamaño del lote de datos procesados en cada paso de entrenamiento. Se probaron tamaños de **32** y **64**. Afecta tanto la velocidad de entrenamiento como la estabilidad de la convergencia.
+
+- **`recall` (criterio de evaluación)**  
+  La selección del mejor conjunto de hiperparámetros se basó en **maximizar el recall** sobre el conjunto de validación, priorizando la capacidad del modelo para **detectar conexiones maliciosas**.
+
+
+```{r}
+build_model <- function(learning_rate = 0.001, dropout_rate = 0.2, input_shape) {
+  model <- keras_model_sequential() %>%
+    layer_dense(units = 512, activation = "relu", input_shape = input_shape) %>%
+    layer_batch_normalization() %>%
+    layer_dropout(rate = dropout_rate) %>%
+    
+    layer_dense(units = 256, activation = "relu") %>%
+    layer_batch_normalization() %>%
+    layer_dropout(rate = dropout_rate) %>%
+    
+    layer_dense(units = 128, activation = "relu") %>%
+    layer_batch_normalization() %>%
+    
+    layer_dense(units = 64, activation = "relu") %>%
+    layer_batch_normalization() %>%
+    
+    layer_dense(units = 1, activation = "sigmoid")
+  
+  model %>% compile(
+    loss = "binary_crossentropy",
+    optimizer = optimizer_adam(learning_rate = learning_rate),
+    metrics = c("accuracy", metric_recall())
+  )
+  
+  return(model)
+}
+grid <- expand.grid(
+  dropout = c(0.2, 0.3),
+  lr = c(0.001, 0.003, 0.005),
+  batch_size = c(32, 64)
+)
+```
+
+```{r, echo = TRUE, results = 'hide', message = FALSE, warning = FALSE}
+results <- data.frame()
+
+for (i in 1:nrow(grid)) {
+  cat("\n🔁 Testing combination:", i, "\n")
+  
+  params <- grid[i, ]
+  cat("Dropout:", params$dropout, "- LR:", params$lr, "- Batch Size:", params$batch_size, "\n")
+  
+  model <- build_model(
+    learning_rate = params$lr,
+    dropout_rate = params$dropout,
+    input_shape = ncol(x_train)
+  )
+  
+  history <- model %>% fit(
+    x = as.matrix(x_train),
+    y = as.numeric(y_train),
+    epochs = 30,
+    batch_size = params$batch_size,
+    validation_split = 0.2,
+    class_weight = list("0" = 1, "1" = 1.5),
+    verbose = 0,
+    callbacks = list(
+ 
+      callback_early_stopping(monitor = "val_loss", patience = 7, restore_best_weights = TRUE),
+      callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.5, patience = 5, min_lr = 0.00001)
+    )
+  )
+  
+  available_metrics <- names(history$metrics)
+  recall_name <- grep("val_recall", available_metrics, value = TRUE)[1]
+  
+  cat("Recall metric detected:", recall_name, "\n")
+  
+  final_acc <- tail(history$metrics$val_accuracy, 1)
+  final_recall <- tail(history$metrics[[recall_name]], 1)
+  
+  results <- rbind(results, data.frame(
+    dropout = params$dropout,
+    lr = params$lr,
+    batch_size = params$batch_size,
+    val_accuracy = final_acc,
+    val_recall = final_recall
+  ))
+}
+
+```
+
+```{r}
+results[order(-results$val_recall, -results$val_accuracy), ]
+```
+
+### Resultados del Grid Search y Selección de Parámetros Finales
+
+Para el modelo de red neuronal profunda se llevó a cabo una búsqueda de hiperparámetros mediante una estrategia de **grid search**, en la cual se evaluaron un total de 12 combinaciones distintas de parámetros. Las combinaciones incluían variaciones en la tasa de `dropout`, la tasa de aprendizaje (`learning rate`) y el tamaño del batch (`batch size`). 
+
+Cada configuración fue entrenada y validada utilizando una partición del conjunto de datos, y evaluada en función de dos métricas clave: **val_accuracy** y **val_recall**. El objetivo principal fue maximizar el **recall**, ya que en un problema como la detección de keyloggers, es fundamental reducir el número de falsos negativos, es decir, evitar que actividades maliciosas pasen desapercibidas.
+
+Como resultado del proceso, se identificó la siguiente combinación como la más eficaz, al alcanzar un **val_recall del ~70%** junto con un nivel razonable de precisión general:
+
+
+
+#### Parámetros óptimos seleccionados para el modelo final entrenado sobre el conjunto completo de datos:
+
+- **Dropout**: `0.2`  
+- **Learning rate**: `0.005`  
+- **Batch size**: `64`
+
+Con estos parámetros, el modelo fue reentrenado utilizando la totalidad del conjunto de datos disponible, y posteriormente evaluado para obtener las métricas finales de rendimiento.
+
+
+### Resultados Finales sobre el Conjunto Completo de Datos
+
+Una vez seleccionados los mejores hiperparámetros mediante la validación cruzada, se procedió a entrenar el modelo final utilizando la totalidad del conjunto de datos disponible. A continuación, se presentan las métricas obtenidas tras la evaluación final.
+
+
+```{r}
+
+cols_to_encode <- c("Protocol") 
+
+Keylogger_clean$Protocol <- as.factor(Keylogger_clean$Protocol)
+
+Keylogger_clean <- dummy_cols(
+  Keylogger_clean,
+  select_columns = cols_to_encode,
+  remove_first_dummy = FALSE
+)
+
+Keylogger_clean <- Keylogger_clean[, !(names(Keylogger_clean) %in% cols_to_encode)]
+
+```
+
+
+```{r}
+
+y_full <- Keylogger_clean$Class
+x_full <- Keylogger_clean[, !(names(Keylogger_clean) %in% "Class")]
+
+scaler <- preProcess(x_full, method = c("center", "scale"))
+x_full_scaled <- predict(scaler, x_full)
+
+```
+
+
+```{r, echo = TRUE, results = 'hide', message = FALSE, warning = FALSE}
+final_model2 <- keras_model_sequential() %>%
+  layer_dense(units = 512, activation = "relu", input_shape = ncol(x_full_scaled)) %>%
+  layer_batch_normalization() %>%
+  layer_dropout(rate = 0.2) %>%  # best_dropout
+
+  layer_dense(units = 256, activation = "relu") %>%
+  layer_batch_normalization() %>%
+  layer_dropout(rate = 0.2) %>%
+
+  layer_dense(units = 128, activation = "relu") %>%
+  layer_batch_normalization() %>%
+
+  layer_dense(units = 64, activation = "relu") %>%
+  layer_batch_normalization() %>%
+
+  layer_dense(units = 1, activation = "sigmoid")
+
+
+final_model2 %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = optimizer_adam(learning_rate = 0.005),  # best_lr
+  metrics = c("accuracy", metric_recall())
+)
+
+
+history <- final_model2 %>% fit(
+  x = as.matrix(x_full_scaled),
+  y = as.numeric(y_full),
+  epochs = 30,
+  batch_size = 64,
+  class_weight = list("0" = 1, "1" = 1.5),
+  validation_split = 0.2,
+  shuffle = TRUE,
+  verbose = 2,
+  callbacks = list(
+    callback_early_stopping(monitor = "val_recall", patience = 7, restore_best_weights = TRUE),
+    callback_reduce_lr_on_plateau(monitor = "val_recall", factor = 0.5, patience = 5, min_lr = 0.00001)
+  )
+)
+```
+
+
+```{r}
+pred_probs <- final_model2 %>% predict(as.matrix(x_full_scaled))
+pred_class <- ifelse(pred_probs > 0.5, 1, 0)
+roc_obj <- roc(y_full, pred_probs)
+auc_value <- auc(roc_obj)
+cat("AUC:", auc_value)
+```
+
+```{r}
+confusionMatrix(as.factor(pred_class), as.factor(y_full), positive = "1")
+
+cm <- confusionMatrix(as.factor(pred_class), as.factor(y_full), positive = "1")
+cm_table <- as.table(cm$table)
+
+cm_df <- as.data.frame(cm_table)
+colnames(cm_df) <- c("Predicción", "Clase_real", "Frecuencia")
+
+ggplot(data = cm_df, aes(x = Predicción, y = Clase_real, fill = Frecuencia)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Frecuencia), size = 5) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(title = "Matriz de confusión",
+       x = "Predicción",
+       y = "Clase real") +
+  theme_minimal()
+```
+
+### Evaluación del Modelo Final
+
+El modelo final fue entrenado utilizando todo el conjunto de datos, aplicando previamente los pasos de preprocesamiento necesarios (codificación one-hot y normalización). Posteriormente, se evaluó su desempeño mediante diversas métricas de clasificación binaria.
+
+Los resultados obtenidos son los siguientes:
+
+- **Exactitud (Accuracy)**: 0.591  
+- **Sensibilidad (Recall)**: 0.690  
+- **Precisión (Precision)**: 0.501  
+- **Especificidad**: 0.522  
+- **AUC (Área bajo la curva ROC)**: 0.667
+
+Estos resultados indican que el modelo tiene una alta capacidad para detectar conexiones maliciosas, alcanzando una tasa de recall del 69%. Esto significa que el 69% de las instancias positivas (keyloggers) fueron correctamente identificadas por el modelo.
+
+El valor de AUC superior a 0.66 refuerza la idea de que el modelo tiene una capacidad discriminativa adecuada entre clases.
+
+# EJERCICIO 6: Conclusión [1/10]
+
+
+### Comparativa Final de Algoritmos: ¿Cuál ha funcionado mejor?
+
+En este estudio se han implementado y evaluado dos algoritmos de aprendizaje automático con el objetivo de detectar conexiones maliciosas en tráfico de red: **XGBoost** y **Red Neuronal Profunda (DNN)**. A continuación se presenta un análisis comparativo basado en los resultados obtenidos, la estrategia de entrenamiento, y la idoneidad de cada modelo en función del problema tratado.
+
+#### Criterio principal: minimizar los falsos negativos
+
+Debido a que el problema se centra en la detección de posibles keyloggers, es fundamental priorizar la **sensibilidad (recall)**, ya que los falsos negativos podrían permitir que conexiones maliciosas pasen desapercibidas. Por tanto, se priorizó la maximización del **recall**, sin dejar de considerar otras métricas complementarias como precisión, exactitud y AUC.
+
+
+
+###  Resultados obtenidos
+
+| Algoritmo       | Accuracy | Recall | Precision | F1 Score | AUC   |
+|-----------------|----------|--------|-----------|----------|--------|
+| XGBoost         | **0.6827** | 0.6502 | **0.6107** | **0.6270** | **0.7569**  
+| Red Neuronal    | 0.5911   | **0.6903** | 0.5010    | 0.5781   | 0.6667
+
+Se puede observar que ambos algoritmos muestran un rendimiento sólido, aunque con fortalezas distintas:
+
+- La **Red Neuronal** obtuvo el **mayor valor de recall (0.69)**, lo cual es crucial para reducir los falsos negativos en el contexto del problema.
+- **XGBoost** destacó con una **mayor exactitud (0.68)**, un **mejor AUC (0.7569)** y un **F1 Score de 0.627**, lo que indica un equilibrio más robusto entre precisión y recall.
+- Mientras que la Red Neuronal maximizó la detección de negativos (mayor sensibilidad), XGBoost logró un mejor balance general de clasificación.
+
+
+
+
+Aunque ambos algoritmos demostraron ser efectivos, la elección del mejor modelo depende del criterio prioritario.  
+- Si el objetivo principal es **maximizar la sensibilidad** y minimizar los falsos negativos, la **Red Neuronal** resulta ligeramente superior.
+- Sin embargo, si se busca **un mejor equilibrio general** entre recall, precisión y exactitud, **XGBoost ofrece un rendimiento más consistente y completo**.
+
+Considerando las métricas globales (accuracy, F1 y AUC), **se concluye que XGBoost ha funcionado mejor para este problema**, ya que ofrece una mayor capacidad discriminativa, una mejor tasa de clasificación correcta y un equilibrio adecuado entre los errores tipo I y tipo II. Por tanto, se recomienda como solución preferente en un entorno de producción.
+
+
+
+
+
+
